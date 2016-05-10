@@ -1,0 +1,1043 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Рекомендательная система фильмов на данных MovieLens\n",
+    "\n",
+    "Выполнил Алескин Александр, 317 группа"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [],
+   "source": [
+    "import sys\n",
+    "import numpy as np\n",
+    "import scipy as sp\n",
+    "import scipy.sparse \n",
+    "import scipy.sparse.linalg\n",
+    "import pandas as pd\n",
+    "from mrjob.job import MRJob\n",
+    "import matplotlib.pyplot as plt\n",
+    "import time\n",
+    "import json\n",
+    "from  IPython.display import HTML as html\n",
+    "import requests, zipfile, StringIO\n",
+    "\n",
+    "%matplotlib inline"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Загрузим файлы:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "paths  ['ml-1m/', 'ml-1m/movies.dat', 'ml-1m/ratings.dat', 'ml-1m/README', 'ml-1m/users.dat']\n"
+     ]
+    }
+   ],
+   "source": [
+    "req = requests.get('http://files.grouplens.org/datasets/movielens/ml-1m.zip', stream=True)\n",
+    "archive = zipfile.ZipFile(StringIO.StringIO(req.content))\n",
+    "print 'paths ', archive.namelist()\n",
+    "\n",
+    "# ознакомимся с Readme\n",
+    "# print '\\nREADME\\n', archive.open('ml-1m/README').read()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Content-based модель"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Так как в данном пункте не предполагается использования библиотеки mrjob, то преобразуем в удобный формат данные, преобразуем данные (выполняет fit_transform) и разобьем на обучающую и тестовую выборку:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 19,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [],
+   "source": [
+    "def fit_transform(ratings, users, movies):\n",
+    "    \n",
+    "    scores = (ratings[:, 2]) / 5.0\n",
+    "\n",
+    "    # итак, посчитаем количество признаков:\n",
+    "    #    от пользователя: 2 - пол, 7 - возраст, 21 - профессия 1 - с.р. пользователя, всего: 31\n",
+    "    #    от фильма: 1 - средний рейтинг фильма, 18 - Жанр, 9 - год выпуска(по десятилетиям),\n",
+    "    #               1 - количество жанров, всего 29\n",
+    "    #    от оценок: 1 - корреляция взглядов,   всего: 1\n",
+    "    # итого : 31 + 29 + 1 + 1(константный признак)= 62\n",
+    "    u = 31\n",
+    "    m = 29 # при изменение возможно надо будет ниже поменять еще что-нибудь\n",
+    "    n = u + m + 2\n",
+    "\n",
+    "    # определим функцию, возвращающая номер позиции для категориального признака:\n",
+    "    def get_position(dictionary, key):\n",
+    "        try:\n",
+    "            pos = dictionary[key]\n",
+    "        except KeyError:\n",
+    "            pos = len(dictionary)\n",
+    "            dictionary[key] = pos\n",
+    "        return pos\n",
+    "\n",
+    "    X = np.zeros((ratings.shape[0], n))\n",
+    "\n",
+    "    # так и так придеться делать перебором, причем умным перебором не факт что ускорение будет значительным\n",
+    "    # поэтому влоб в 2 этапа:\n",
+    "\n",
+    "    # movies\n",
+    "    movies2 = np.zeros((movies.shape[0], m))\n",
+    "    map_movie_genre = {}\n",
+    "    map_movie_year = {}\n",
+    "\n",
+    "    for i in range(movies.shape[0]):\n",
+    "        # score\n",
+    "        j = np.where(ratings[:, 1] == int(movies[i, 0]))[0]\n",
+    "        if len(j) > 0:\n",
+    "            movies2[i, 0] = scores[j].mean()\n",
+    "\n",
+    "            # year\n",
+    "            offset = 1\n",
+    "            title = movies[i, 1]\n",
+    "            sd = title.find('(19')\n",
+    "            if sd == -1:\n",
+    "                sd = title.find('(20')\n",
+    "            year = title[sd + 1:sd + 4]\n",
+    "            pos = get_position(map_movie_year, year) \n",
+    "            movies2[i, pos + offset] = 1\n",
+    "\n",
+    "            # genre\n",
+    "            offset = 10\n",
+    "            genres = movies[i,2].split('|')\n",
+    "            for genre in genres:\n",
+    "                pos = get_position(map_movie_genre, genre)\n",
+    "                movies2[i, pos + offset] = 1\n",
+    "            # amount of genres\n",
+    "            movies2[i: , -1] = len(genres)\n",
+    "\n",
+    "    # users\n",
+    "    users2 = np.zeros((users.shape[0], u + 18))\n",
+    "    map_user_age = {}\n",
+    "    map_user_prof = {}\n",
+    "\n",
+    "    for i in range(users.shape[0]):\n",
+    "        # score\n",
+    "        j = np.where(ratings[:, 0] == int(users[i, 0]))[0]\n",
+    "        if len(j) > 0:\n",
+    "            users2[i, 0] = scores[j].mean()\n",
+    "\n",
+    "            # sex\n",
+    "            if users[i, 1] == 'M':\n",
+    "                users2[i, 1] = 1\n",
+    "            else:\n",
+    "                users2[i, 2] = 1\n",
+    "\n",
+    "            #age\n",
+    "            offset = 3\n",
+    "            pos = get_position(map_user_age, users[i, 2])\n",
+    "            users2[i, pos + offset] = 1\n",
+    "\n",
+    "            # profession\n",
+    "            offset += 7\n",
+    "            pos = get_position(map_user_prof, users[i, 3])\n",
+    "            users2[i, pos + offset] = 1\n",
+    "\n",
+    "            # special \n",
+    "            offset += 21\n",
+    "            gen_scores = np.zeros(18)\n",
+    "            gen_sc_amount = np.zeros(18)\n",
+    "            for mv in range(len(j)):\n",
+    "                gen = movies2[np.where(movies[:, 0] == ratings[j[mv], 1])[0]][0, -19:-1]\n",
+    "                gen_sc_amount += gen\n",
+    "                gen_scores += gen * scores[j[mv]]\n",
+    "            users2[i, offset:] = gen_scores / (gen_sc_amount + 1e-4)\n",
+    "\n",
+    "    # 2nd step\n",
+    "    X[:, -1] = 1 # constant for regression task\n",
+    "    for i in range(ratings.shape[0]):\n",
+    "        user = users2[np.where(users[:, 0] == ratings[i, 0])[0]][0]\n",
+    "        movie = movies2[np.where(movies[:, 0] == ratings[i, 1])[0]][0]\n",
+    "        X[i, :u] = user[:u]\n",
+    "        X[i, u:-2] = movie\n",
+    "        X[i, -2] = user[u:].dot(movie[10:-1].T) / movie[-1] \n",
+    "    return X, scores"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 20,
+   "metadata": {
+    "collapsed": false,
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "users = pd.read_csv(StringIO.StringIO(archive.open('ml-1m/users.dat').read()),\n",
+    "                    sep='::', header=None, engine='python').values\n",
+    "ratings = pd.read_csv(StringIO.StringIO(archive.open('ml-1m/ratings.dat').read()),\n",
+    "                      sep='::', header=None, engine='python').values\n",
+    "movies = pd.read_csv(StringIO.StringIO(archive.open('ml-1m/movies.dat').read()),\n",
+    "                     sep='::', header=None, engine='python').values\n",
+    "\n",
+    "time_for_transform = - time.time()\n",
+    "X, scores = fit_transform(ratings, users, movies)\n",
+    "time_for_transform += time.time()\n",
+    "\n",
+    "ind = np.argsort(ratings[:, 3])\n",
+    "X = X[ind]\n",
+    "y = scores[ind]\n",
+    "l = int(y.shape[0] * 0.8)\n",
+    "X_train = X[:l]\n",
+    "X_test = X[l:]\n",
+    "y_train = y[:l]\n",
+    "y_test = y[l:]\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "В качестве 2 дополнительных признаков были взяты год фильма и количество жанров у фильма."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Так как рейтинг ищем как линейную комбинацию признаков, то для подбора весов воспользуемся Ridge-регресии: \n",
+    "$$ || Xw - y ||^2 + \\lambda||w||^2  \\to min$$\n",
+    "Тогда оптимальное значения для весов можно искать как решение следующей СЛАУ:\n",
+    "$$ (X^TX + \\lambda I) w = X^T y $$\n",
+    "\n",
+    "Реализуем вычисления, добавив возможность поиска оптимального параметра:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 21,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [],
+   "source": [
+    "def compute_content(X_train, y_train, a=0.2, Search=False, X_test=None, y_test=None):\n",
+    "    if Search: \n",
+    "        if (X_test is None) or (y_test is None):\n",
+    "            raise ValueError('enter X_test and y_test')\n",
+    "        if type(a) == float or type(a) == int:\n",
+    "            a = [a]\n",
+    "        scores = np.zeros(len(a))\n",
+    "        for i in range(len(a)):\n",
+    "            w = np.linalg.solve(X_train.T.dot(X_train) + a[i] * np.eye(X_train.shape[1]), X_train.T.dot(y_train))\n",
+    "            scores[i] = ((y_test - X_test.dot(w)) ** 2).sum() / y_test.shape[0]\n",
+    "        return scores\n",
+    "    else:\n",
+    "        return np.linalg.solve(X_train.T.dot(X_train) + a * np.eye(X_train.shape[1]), X_train.T.dot(y_train))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 30,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "<matplotlib.text.Text at 0x11df39bd0>"
+      ]
+     },
+     "execution_count": 30,
+     "metadata": {},
+     "output_type": "execute_result"
+    },
+    {
+     "data": {
+      "image/png": "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\ntAtaBAAAAABJRU5ErkJggg==\n",
+      "text/plain": [
+       "<matplotlib.figure.Figure at 0x12ad1eb50>"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "lams = np.array([0.01, 0.1, 1, 2, 5, 10, 100, 1e3, 1e4, 1e5])\n",
+    "scores = compute_content(X_train, y_train, lams, True, X_test, y_test)\n",
+    "plt.xscale('log')\n",
+    "plt.plot(lams, scores)\n",
+    "plt.title('MSE of content model')\n",
+    "plt.xlabel('lambda')\n",
+    "plt.ylabel('MSE')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Как видно результат не сильно зависит от параметра. Оптимальное значение при $ \\lambda = 100 $. Вероятная причина -- задача хорошо аппроксимируется линейной моделью."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Оценим точность и время работы(c учетом преобразования признаков) алгоритма:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 98,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "best score is  0.0314542961354  . Total time  307.012928963  s, \n",
+      " where transform compute  0.999648558634 % of all time.\n",
+      "regression computes in  0.107897043228  s.\n"
+     ]
+    }
+   ],
+   "source": [
+    "comp = -time.time()\n",
+    "w = compute_content(X_train, y_train, 100)\n",
+    "comp += time.time()\n",
+    "score = ((y_test - X_test.dot(w)) ** 2).sum() / y_test.shape[0]\n",
+    "print 'best score is ', score, ' . Total time ', comp + time_for_transform, ' s, \\n where transform compute ',\\\n",
+    "        time_for_transform / (comp + time_for_transform), '% of all time.'\n",
+    "print 'regression computes in ', comp, ' s.'"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Почти все время уходит на преобразование данных. Такое долгое преобразование связано с тем, что приходиться поэлементо работать, а так же выделять из строк данные."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. Neighborhood based"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "В данном подходе определяют меру adjusted cosine similarity похожести фильмов i и j как векторов в пространстве пользователей:\n",
+    "    $$ sim(i, j) = \\frac{\\sum_{u \\in U} (r_{u, i} - \\overline{r_u}) (r_{u, j} - \\overline{r_u})}{ \\sqrt{\\sum_{u \\in U} (r_{u, i} - \\overline{r_u})^2} \\sqrt{\\sum_{u \\in U} (r_{u, j} - \\overline{r_u})^2} }$$\n",
+    "    \n",
+    "\n",
+    "где $U$ – множество пользователей, которые оценили фильмы $i$ и $j$, $\\overline{r_u}$ – средний рейтинг пользователя u.\n",
+    "\n",
+    "Рейтинги для неизвестных фильмов считаются по следующей формуле:\n",
+    "\n",
+    "$$ \\hat{r}_{u, i} = \\frac{\\sum_{j : r_{u, j} \\neq 0} sim(i, j) r_{u, j}} {\\sum_{j : r_{u, j} \\neq 0} sim(i, j)} $$\n",
+    "\n",
+    "Такой подход называется item-oriented. его и будем реализовывать. Однако, существует аналогичный метод user-oriented, где сравнивается сами пользователи. В таком варианте формулы остаються почти без изменений:\n",
+    "\n",
+    "$$ sim(u, w) = \\frac{\\sum_{i \\in M} (r_{u, i} - \\overline{r_i}) (r_{w, i} - \\overline{r_i})}{ \\sqrt{\\sum_{i \\in M} (r_{u, i} - \\overline{r_i})^2} \\sqrt{\\sum_{i \\in M} (r_{w, i} - \\overline{r_i})^2} }$$\n",
+    "\n",
+    "где $M$ – множество фильмов, которые оценили пользователи $u$ и $m$, $\\overline{r_i}$ – средний рейтинг фильма $i$.\n",
+    "\n",
+    "$$ \\hat{r}_{u, i} = \\frac{\\sum_{w : r_{w, i} \\neq 0} sim(u, w) r_{w, i}} {\\sum_{w : r_{w, i} \\neq 0} sim(u, w)} $$\n",
+    "\n",
+    "\n",
+    "Так как задание предполагается выполнить в парадигме map-reduce, то дабы не усложнять код, опишем класс для запуска в отдельном файле runner.py, листинг которого приведен ниже:\n",
+    "```python\n",
+    "\n",
+    "class Neighborhood(MRJob):\n",
+    "    def steps(self):\n",
+    "        return [\n",
+    "                    MRStep(mapper=self.user_rating, reducer= self.user_count),\n",
+    "                    MRStep(mapper=self.remix, reducer = self.similarity),\n",
+    "                    MRStep(mapper=self.pseudo_matrix, reducer=self.save_matrix)\n",
+    "               ]\n",
+    "\n",
+    "    def user_rating(self, key, line):\n",
+    "        user_id, movie_id, rate, time = line.split(',')\n",
+    "        yield user_id, (movie_id, rate)\n",
+    "\n",
+    "    def user_count(self, user_id, values):\n",
+    "        user_rates = 0\n",
+    "        user_mean = 0\n",
+    "        final = []\n",
+    "        for movie_id, rate in values:\n",
+    "            r = float(rate) # / 5\n",
+    "            user_rates += 1\n",
+    "            user_mean += r\n",
+    "            final.append([int(movie_id), r])\n",
+    "\n",
+    "        user_mean /= (user_rates + 1e-5)\n",
+    "        for i in range(len(final)):\n",
+    "            final[i][1] -= user_mean\n",
+    "\n",
+    "        yield user_id, final\n",
+    "\n",
+    "    def remix(self, user_id, values):\n",
+    "        for item1, item2 in combinations(values, 2):\n",
+    "            yield (item1[0], item2[0]), (item1[1], item2[1])\n",
+    "\n",
+    "    def similarity(self, pair_id, rates):\n",
+    "        sum_x = 0\n",
+    "        sum_y = 0\n",
+    "        sum_xy = 0\n",
+    "        for rate_x, rate_y in rates:\n",
+    "            sum_x += rate_x ** 2\n",
+    "            sum_y += rate_y ** 2\n",
+    "            sum_xy += rate_x * rate_y\n",
+    "        simila = sum_xy / (np.sqrt(sum_x) * np.sqrt(sum_y))\n",
+    "        if simila < eps:\n",
+    "            simila = 0\n",
+    "        yield pair_id, simila\n",
+    "\n",
+    "    def pseudo_matrix(self, pair_id, simila):\n",
+    "        pair = pair_id\n",
+    "        sim = simila\n",
+    "        yield pair[0], (pair[1], sim)\n",
+    "        yield pair[1], (pair[0], sim)\n",
+    "\n",
+    "    def save_matrix(self, movie_id, relate_movie):\n",
+    "        related = []\n",
+    "        for item in relate_movie:\n",
+    "            related.append(item)\n",
+    "        related.sort(key= lambda x: x[1], reverse=True)\n",
+    "        yield movie_id, related\n",
+    "\n",
+    "\n",
+    "if __name__ == '__main__':\n",
+    "    Neighborhood.run()\n",
+    "```\n",
+    "\n",
+    "преобразуем входные данные:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 354,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "('ratings in train:', 797758)\n",
+      "('ratings in test:', 202451)\n"
+     ]
+    }
+   ],
+   "source": [
+    "ratings = pd.read_csv(StringIO.StringIO(archive.open('ml-1m/ratings.dat').read()),\n",
+    "                      sep='::', header=None, engine='python')\n",
+    "ratings2 = {}\n",
+    "for r in ratings.values:\n",
+    "    try:\n",
+    "        ratings2[r[0]].append(r[1:])\n",
+    "    except KeyError:\n",
+    "        ratings2[r[0]] = [r[1:]]\n",
+    "\n",
+    "        train_frac = 0.8\n",
+    "train = []\n",
+    "test = []\n",
+    "for u, itemList in ratings2.items():\n",
+    "    # itemList = [(i, r, t), ...]\n",
+    "    all = sorted(itemList, key=lambda x: x[2])\n",
+    "    thr = int((len(all) * train_frac))\n",
+    "    train.extend(map(lambda x: (u, x[0], x[1] / 5.0), all[:thr]))\n",
+    "    test.extend(map(lambda x: (u, x[0], x[1] / 5.0), all[thr:]))\n",
+    "    \n",
+    "train = np.array(train)\n",
+    "train[:, :2] -= 1\n",
+    "test = np.array(test)\n",
+    "test[:, :2] -= 1\n",
+    "print(\"ratings in train:\", len(train))\n",
+    "print(\"ratings in test:\", len(test)) \n",
+    "rate_train = pd.DataFrame(train)\n",
+    "rate_train.iloc[:, 1] = np.int32(rate_train.iloc[:, 1].values)\n",
+    "rate_train.to_csv('ratings.dat', sep=',', index=False, header=False)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Запустим mrjob через терминал:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 376,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "time for learning  863.294950008\n"
+     ]
+    }
+   ],
+   "source": [
+    "fit_time = -time.time()\n",
+    "!python runner.py  ratings.dat -r local —jobconf mapred.map.tasks=3 —jobconf mapred.reduce.tasks=3   >out.dat\n",
+    "fit_time += time.time()\n",
+    "print 'time for learning ', fit_time"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Для удобной работы с полученной матрицей близости и упрощения исследований опишем соответствующие функции:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 370,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [],
+   "source": [
+    "def get_cov(path, N=50, M = 3952):\n",
+    "    f = open(path)\n",
+    "    lines = f.readlines()\n",
+    "    lines = [line.split('\\t') for line in lines]\n",
+    "    C = np.zeros((M, M))\n",
+    "    for line in lines:\n",
+    "        vals = np.array(json.loads(line[1]))[:N ]\n",
+    "        try:\n",
+    "            C[int(line[0]), np.int32(vals[:, 0])] = vals[:, 1]\n",
+    "        except IndexError:\n",
+    "            pass\n",
+    "    return C\n",
+    "\n",
+    "def count_score(rate_test, rate_train, C, U = 6040, M = 3952):\n",
+    "    eps=1e-6\n",
+    "    submited = sp.sparse.csr_matrix((rate_train[:, 2], (rate_train[:,0], rate_train[:,1])), shape=(U, M))\n",
+    "    submited = submited.toarray()\n",
+    "    #submited_bool = np.int32(submited > 0)\n",
+    "    #mvs = np.int32(rate_test.values[:, 1])\n",
+    "    #usrs = np.int32(rate_test.values[:, 0])\n",
+    "    errs = np.zeros(rate_test.shape[0])\n",
+    "    for i in range(rate_test.shape[0]):\n",
+    "        x = submited[int(rate_test[i, 0])]\n",
+    "        j = np.where(x)[0]\n",
+    "        if len(j) > 0:\n",
+    "            x = x[j]\n",
+    "            C_c = C[int(rate_test[i, 1])][j]\n",
+    "            errs[i] = C_c.dot(x) / (eps + np.sum(C_c))\n",
+    "        else:\n",
+    "            errs[i] = 0.6\n",
+    "    return np.sum((errs - rate_test[:, 2]) ** 2) / errs.shape[0]"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Исследуем как зависит скорость вычислений и точность от количества сохраняемых похожих элементов в матрице:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 378,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th>N</th>\n",
+       "      <th>MSE train data</th>\n",
+       "      <th>MSE test data</th>\n",
+       "      <th>Time, s</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <td>10.0</td>\n",
+       "      <td>0.549536</td>\n",
+       "      <td>0.495164</td>\n",
+       "      <td>21.875653</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <td>25.0</td>\n",
+       "      <td>0.536983</td>\n",
+       "      <td>0.477071</td>\n",
+       "      <td>22.118435</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <td>50.0</td>\n",
+       "      <td>0.520336</td>\n",
+       "      <td>0.455025</td>\n",
+       "      <td>21.967035</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <td>100.0</td>\n",
+       "      <td>0.462529</td>\n",
+       "      <td>0.411446</td>\n",
+       "      <td>21.796632</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <td>250.0</td>\n",
+       "      <td>0.165385</td>\n",
+       "      <td>0.184282</td>\n",
+       "      <td>21.899953</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <td>500.0</td>\n",
+       "      <td>0.036413</td>\n",
+       "      <td>0.056640</td>\n",
+       "      <td>22.336408</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <td>1000.0</td>\n",
+       "      <td>0.024641</td>\n",
+       "      <td>0.035954</td>\n",
+       "      <td>20.652716</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <td>2500.0</td>\n",
+       "      <td>0.025303</td>\n",
+       "      <td>0.035114</td>\n",
+       "      <td>20.717383</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>"
+      ],
+      "text/plain": [
+       "<IPython.core.display.HTML object>"
+      ]
+     },
+     "execution_count": 378,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "Ns = np.array([10, 25, 50, 100, 250, 500, 1000, 2500])\n",
+    "results = np.zeros((Ns.size, 3))\n",
+    "for i in range(Ns.size):\n",
+    "    start = time.time()\n",
+    "    C = get_cov('out.dat', N=Ns[i])\n",
+    "    results[i, 1] = count_score(test, train, C)\n",
+    "    results[i, 2] = time.time() - start + fit_time\n",
+    "    results[i, 0] = count_score(train, train, C)\n",
+    "\n",
+    "res = pd.DataFrame(np.hstack((Ns[np.newaxis].T, results)),\n",
+    "                   columns=['N', 'MSE train data', 'MSE test data', 'Time, s'])\n",
+    "res['Time, s'] -=fit_time\n",
+    "html(res.to_html(index=False))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Такая плохая точность при N < 100 обесняется тем, что пользователь мог не оценить фильмы, которые сильно коррелирует с данным. Поэтому для приемлимой точности надо брать N > 500. \n",
+    "\n",
+    "Почти одинаковое время для выполнения для любого N связано с тем, что используются матричные вычисления для полных матриц(использование разреженных матриц замедляет вычисления). Небольшая вариация связана с возможным паралелльным использованием ноутбука в других целях. \n",
+    "\n",
+    "Общее вермя алгоритма с учетом обучения составляет примерно 14.7 минуты."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3. Latent factor based"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "В данном подходе оценка представляется как скалярное произведение векторов $ p_u , q_i \\in R^k $:\n",
+    "$$ r_{u, i} = p_u^T q_i $$\n",
+    "\n",
+    "Для настройки модели минимизируем следующий функционал:\n",
+    "\n",
+    "$$ \\sum_{u, i, r_{u, i}} [(r_{u, i} - p_u^T q_i) ^ 2  + \\lambda_p p_u^T p_u + \\lambda_q q_i^T t_i ] $$\n",
+    "\n",
+    "где суммирование ведется по всем тройкам выборки $ u, i, r_{u, i} $.\n",
+    "\n",
+    "Будем пользоваться пошаговым методом оптимизации ALS. Пусть даны некоторые приближения матрицы $ P \\in R^{|u| \\times K}, Q \\in R^{|i| \\times K} $, характеризующие пользователей и фильмы. Матрицей $ Q[u] \\in R^{n_u \\dot K}$ будем обозначать подматрицу матрицы $Q$ только для фильмов, оцененных пользователем $u$, где $n_u$ – количество оценок пользователя $u$.\n",
+    "В методе проводятся $N$ итераций, в рамках каждой итерации сначала оптимизируется $P $при фиксированном\n",
+    "$Q$, затем $Q$ при фиксированном $P$.\n",
+    "Шаг перенастройки $p_u$ при фиксированной матрице $Q$ сводится к настройке ridge-регрессии и выглядит так:\n",
+    "\n",
+    "$$ A_u = Q[u]^T Q[u] $$\n",
+    "$$ d_u = Q[u]^T r_u $$\n",
+    "$$ p_u = (\\lambda_p n_u I + A_u)^{−1}d_u $$\n",
+    "\n",
+    "Аналогично выглядит перенастройка для фильмов(через $ P[i] $ аналогично с $ Q[u] $ обозначается подматрица $ P $ пользователей, которые оценили данный фильм):\n",
+    "\n",
+    "$$ B_i = P[i]^T P[i] $$\n",
+    "$$ d_i = P[i]^T r_i $$\n",
+    "$$ q_i = (\\lambda_q n_i I + B_i)^{−1}d_i $$\n",
+    "\n",
+    "\n",
+    "опишем функцию реализующий минимизацию функционала:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 231,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [],
+   "source": [
+    "def latent(X_train, a_p = 0.2, a_q = 0.001, N = 20, K =10):\n",
+    "    \"\"\"\n",
+    "    params:\n",
+    "    X_train: array with shape(|U| , |M|), where |U| - amount of users, |M| - amount of movies\n",
+    "    a_p: parameter for 2nd summand \n",
+    "    a_q: parameter for 3th summand\n",
+    "    N: amount of iterations\n",
+    "    K: dimension of vectors p and q\n",
+    "    \n",
+    "    return arrays of P, Q with shapes (|U|, K) and (|M|, K)\n",
+    "    \n",
+    "    \"\"\"\n",
+    "    \n",
+    "    u = X_train.shape[0]\n",
+    "    m = X_train.shape[1]\n",
+    "    np.random.seed(243)\n",
+    "    Q = 0.1 * np.random.random((m, K))\n",
+    "    P = 0.1 * np.random.random((u, K))\n",
+    "    \n",
+    "    for i in range(N):\n",
+    "        for j in range(u):\n",
+    "            x = X_train[j]\n",
+    "            rows = np.where(x)[0]\n",
+    "            x_n = x[rows]\n",
+    "            if rows.size:\n",
+    "                Q_u = Q[rows]\n",
+    "                A = Q_u.T.dot(Q_u)\n",
+    "                D = Q_u.T.dot(x_n)\n",
+    "                P[j] = np.linalg.solve(a_p * rows.size * np.eye(A.shape[0]) + A, D)\n",
+    "        \n",
+    "        for j in range(m):\n",
+    "            x = X_train[:, j]\n",
+    "            rows = np.where(x)[0]\n",
+    "            x_n = x[rows]\n",
+    "            if rows.size:\n",
+    "                P_m = P[rows]\n",
+    "                A = P_m.T.dot(P_m)\n",
+    "                D = P_m.T.dot(x_n)\n",
+    "                Q[j] = np.linalg.solve(a_q * rows.size * np.eye(A.shape[0]) + A, D)\n",
+    "        \n",
+    "    return P, Q\n",
+    "\n",
+    "def score_predict(ratings_test, P, Q):\n",
+    "    n = ratings_test.shape[0]\n",
+    "    error = 0\n",
+    "    for i in range(n):\n",
+    "        error += (ratings_test[i, 2] - P[int(ratings_test[i, 0])].dot(Q[int(ratings_test[i, 1])].T)) ** 2\n",
+    "    return error / float(n)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Преобразуем данные в нужный формат(перенумеруем фильмы, ибо идут они не по порядку):"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 312,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "('ratings in train:', 797758)\n",
+      "('ratings in test:', 202451)\n"
+     ]
+    }
+   ],
+   "source": [
+    "def create_matrix(rates, U = 6040, M = 3952):\n",
+    "    \"\"\"\n",
+    "    U - amount of users\n",
+    "    M - amount of movies\n",
+    "    return sparse matrix with ratings and shape(U, M)\"\"\"\n",
+    "    \n",
+    "    X = sp.sparse.csr_matrix((rates[:, 2], (rates[:,0], rates[:,1])), shape=(U, M))\n",
+    "    return X.toarray()\n",
+    "\n",
+    "\n",
+    "ratings = pd.read_csv(StringIO.StringIO(archive.open('ml-1m/ratings.dat').read()),\n",
+    "                      sep='::', header=None, engine='python')\n",
+    "ratings2 = {}\n",
+    "for r in ratings.values:\n",
+    "    try:\n",
+    "        ratings2[r[0]].append(r[1:])\n",
+    "    except KeyError:\n",
+    "        ratings2[r[0]] = [r[1:]]\n",
+    "\n",
+    "        train_frac = 0.8\n",
+    "train = []\n",
+    "test = []\n",
+    "for u, itemList in ratings2.items():\n",
+    "    # itemList = [(i, r, t), ...]\n",
+    "    all = sorted(itemList, key=lambda x: x[2])\n",
+    "    thr = int((len(all) * train_frac))\n",
+    "    train.extend(map(lambda x: (u, x[0], x[1] / 5.0), all[:thr]))\n",
+    "    test.extend(map(lambda x: (u, x[0], x[1] / 5.0), all[thr:]))\n",
+    "    \n",
+    "train = np.array(train)\n",
+    "train[:, :2] -= 1\n",
+    "test = np.array(test)\n",
+    "test[:, :2] -= 1\n",
+    "print(\"ratings in train:\", len(train))\n",
+    "print(\"ratings in test:\", len(test))    "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Подберем оптимальные параметры a_p и a_q:"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 313,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[[ 0.04298432  0.03924929  0.03617559  0.03317345  0.0307059 ]\n",
+      " [ 0.03939008  0.03638066  0.03338164  0.03070193  0.03216669]\n",
+      " [ 0.03600212  0.03327279  0.03070394  0.03214432  0.04176799]\n",
+      " [ 0.03326852  0.03078813  0.03221386  0.04181949  0.12210126]\n",
+      " [ 0.03074921  0.03229459  0.04184417  0.12213382  0.52533047]]\n"
+     ]
+    }
+   ],
+   "source": [
+    "a_ps = [0.0001, 0.001, 0.01, 0.1, 1]\n",
+    "a_qs = [0.0001, 0.001, 0.01, 0.1, 1]\n",
+    "scores = np.zeros((5,5))\n",
+    "\n",
+    "X = create_matrix(train)\n",
+    "for i in range(len(a_ps)):\n",
+    "    for j in range(len(a_qs)):\n",
+    "        P, Q = latent(X, a_p = a_ps[i], a_q = a_qs[j])\n",
+    "        scores[i, j] = score_predict(test, P, Q)\n",
+    "print scores"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Как видно от параметров точность несильно зависит. Отметим, что более оптимальные параметры находятся на побочной диагонали, что соответствует: $ p^T q = 0.0001 $. В качестве оптимальных параметров выберем a_p = 0.001, a_q = 0.1 \n",
+    "\n",
+    "Рассмотрим как зивисит точность и скорость классификации от параметра K(размерность векторов $p_u, q_i $). Будем смотреть ошибку на обучающей и тестовой выборке: "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 338,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th>K</th>\n",
+       "      <th>MSE train data</th>\n",
+       "      <th>MSE test data</th>\n",
+       "      <th>Time, s</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <td>2.0</td>\n",
+       "      <td>0.029702</td>\n",
+       "      <td>0.032283</td>\n",
+       "      <td>25.554966</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <td>5.0</td>\n",
+       "      <td>0.026378</td>\n",
+       "      <td>0.030931</td>\n",
+       "      <td>26.108607</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <td>10.0</td>\n",
+       "      <td>0.023327</td>\n",
+       "      <td>0.030702</td>\n",
+       "      <td>29.151968</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <td>25.0</td>\n",
+       "      <td>0.018662</td>\n",
+       "      <td>0.031239</td>\n",
+       "      <td>35.339199</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <td>50.0</td>\n",
+       "      <td>0.014967</td>\n",
+       "      <td>0.031404</td>\n",
+       "      <td>45.287118</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <td>100.0</td>\n",
+       "      <td>0.012027</td>\n",
+       "      <td>0.031145</td>\n",
+       "      <td>80.993232</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <td>200.0</td>\n",
+       "      <td>0.010713</td>\n",
+       "      <td>0.030816</td>\n",
+       "      <td>154.971950</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>"
+      ],
+      "text/plain": [
+       "<IPython.core.display.HTML object>"
+      ]
+     },
+     "execution_count": 338,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "Ks = np.array([2, 5, 10, 25, 50, 100, 200])\n",
+    "\n",
+    "results = np.zeros((Ks.size, 3))\n",
+    "for i in range(Ks.size):\n",
+    "    start = time.time()\n",
+    "    P, Q = latent(X, a_p= 0.001, a_q= 0.1, K= Ks[i])\n",
+    "    results[i, 1] = score_predict(test, P, Q)\n",
+    "    results[i, 2] = time.time() - start\n",
+    "    results[i, 0] = score_predict(train, P, Q)\n",
+    "\n",
+    "res = pd.DataFrame(np.hstack((Ks[np.newaxis].T, results)), index= Ks,\n",
+    "                   columns=['K', 'MSE train data', 'MSE test data', 'Time, s'])\n",
+    "\n",
+    "html(res.to_html(index=False))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Как видно, из таблицы, при $k \\in [2, 25] $ точность примерно одинаковая. То есть разложение на 10 скрытые компоненты уже дает хорошее приближение, которое сложно улучшить. Напомним, что в предыдущем методе neighborhood-based для того же порядка точность надо было хранить более 500 компонент. \n",
+    "\n",
+    "Время вычисления прямопропорционально k возрастает. Если сравнивать точность на обучающей и тестовой выборке, то можно наблюдать переобучение. В данном случае оно не носит пагубный характер на тестовой выборке."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {
+    "collapsed": false
+   },
+   "source": [
+    "## Заключение."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "В данном задании были рассмотрены 3 вида рекомендательных систем, основанные на content-based, neighborhood based и latent factor based моделях. На рассмотренных данных MovieLens лучше всего показал себя алгоритм latent factor с ошибкой 0.030 (в метрике MSE). \n",
+    "\n",
+    "Хотя выиграш в точности по сравнению с первым и вторым алгоритмом не очень значителен и составляет 0.001 и 0.003 соответственно, метод latent factor обладаем рядом преимуществ. Во-первых, алгоритм обучения на порядок быстрее выполняется. Во-вторых, в отличие от метода content-based ему не нужны дополнительные данные о пользователей или фильмах. Более того, для хранения данных ему нужно значительно меньше памяти.\n",
+    "\n",
+    "Анализ данных, на которых алгоритм показывает большую ошибку показал, что\n",
+    "\n",
+    "1. content-based метод ошибается в среднем чаще, но на меньшее значение\n",
+    "2. Методы neighborhood based и latent factor based могут достаточно сильно ошибаться на элементах, которые в реальных задачах соответсвуют новым фильмам или новым пользователям (мало оценок у объектов). \n",
+    "\n",
+    "Для повышения точности вероятно следует комбинировать метод content-based и neighborhood based(или latent factor)."
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 2",
+   "language": "python",
+   "name": "python2"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 2
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython2",
+   "version": "2.7.11"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 0
+}
